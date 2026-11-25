@@ -1,67 +1,256 @@
-# FinAlly Plan Review
+# Implementation Review: `PLAN.md`
 
-## Overall assessment
+This review is ranked by implementation impact. It does not propose changes to
+`PLAN.md`; it identifies decisions that need to be made before agents can
+implement the remaining application consistently.
 
-The plan gives a strong product vision and sensible baseline architecture for a single-user demo. Its embedded review in `PLAN.md` identifies many important implementation gaps. Before implementation begins, the team should turn the remaining ambiguous behavior into an API contract and make a few deployment/runtime decisions explicit. Without that, frontend, backend, and E2E work are likely to diverge.
+## Critical
 
-## Must resolve before parallel implementation
+### 1. The plan has no executable API contract
 
-1. **Publish the API and SSE contract.** Define request bodies, response bodies, error bodies/statuses, timestamp format, rounding rules, and the precise SSE event schema. In particular, specify initial-load behavior and whether a stream event contains a single ticker or a batch. This is the highest-value shared artifact for independent frontend/backend work.
+The endpoint table names routes and gives only two request snippets. It does
+not define response bodies, HTTP status codes, validation rules, error format,
+or whether fields are numbers, strings, nullable, or rounded. This leaves the
+frontend, backend, LLM flow, and E2E suite unable to agree on a boundary.
 
-2. **Choose one persistence mount strategy.** The plan currently describes both a Docker named volume and a project-directory bind mount. Pick one and make the Docker command, compose configuration, scripts, and DB-path defaults agree. A bind mount is more inspectable for a course project; a named volume is less sensitive to host path differences.
+Examples needing an explicit contract include the portfolio/position/P&L
+calculation fields; `/api/portfolio/history` ordering and filters; watchlist
+price and change fields; chat action-result/error fields; and the SSE envelope
+(the existing market implementation sends one event containing a ticker-keyed
+map, whereas the plan says an event contains one ticker). Specify Pydantic/
+TypeScript schemas, validation errors, and representative JSON for every route
+and SSE event before parallel implementation starts.
 
-3. **Define the authoritative price at trade time.** Trades need a clear rule: use the most recent cached price, reject prices older than a configured threshold, and execute the balance/position update plus trade-log insert in one SQLite transaction. State behavior when a price is absent or stale.
+### 2. Watchlist removal conflicts with valuation and trade requirements
 
-4. **Specify chat-action execution semantics.** The plan should say that actions execute in listed order and independently, include their actual execution result in the HTTP response, and persist those results. The initial LLM message cannot accurately describe validation failures that occur after it is generated.
+The plan says the poller tracks the union of watched tickers, and the supplied
+market implementation removes a ticker from both the source and price cache on
+watchlist removal. A user can therefore remove a ticker they still hold, after
+which the position has no current price for the positions table, heatmap,
+portfolio total, trade execution, or snapshots. The same issue applies to
+ticker detail/history after removal.
 
-5. **Define startup and background-task lifecycle.** Use FastAPI lifespan to initialize the DB, select/start the market source, create an initial portfolio snapshot, and cancel tasks cleanly at shutdown. Explicitly guard against duplicate pollers/snapshot tasks when reload or multiple worker processes are used.
+Define the subscribed universe as at least `watchlist UNION open-position
+tickers` (and state when to stop tracking a closed, un-watched ticker), or
+forbid removal while holding it. Also define who reconciles that universe at
+startup and atomically after manual or LLM watchlist/trade mutations.
 
-6. **Decide the intended deployment concurrency.** An in-memory price cache and in-process simulator are correct only for a single process. Pin the production command to one Uvicorn worker, or move price state/coordination to a shared service before advertising multi-worker/container deployment.
+### 3. Trade execution is not specified as an atomic financial transaction
 
-## Important design corrections
+Cash, position, immutable trade log, and immediate portfolio snapshot must be
+committed together. The plan does not state transaction boundaries, concurrency
+handling, idempotency, price freshness, or the exact cost-basis/sell algorithm.
+Concurrent manual and chat requests could both pass an insufficient-cash or
+insufficient-shares check, and a price update between validation and write
+makes the advertised fill price ambiguous.
 
-- The document contains mojibake (corrupted em-dash, arrow, and box-drawing characters), which will make the shared spec harder to read and copy. Save `PLAN.md` as UTF-8 and replace the corrupted sequences.
-- `OPENROUTER_API_KEY` is required only when mock mode is disabled. Startup should fail clearly when a real LLM is selected without a key, rather than failing on the first chat request.
-- The default simulated price source should be labeled clearly in the UI (for example, `SIMULATED`) and the app should include a no-investment-advice/demo disclaimer.
-- Normalize symbols to uppercase, validate their format, and define behavior for unpriceable/unknown symbols. Continue pricing held symbols even if they are removed from the watchlist.
-- Use decimal arithmetic for cash, prices, and order values where feasible. If floating point remains a deliberate simplification, define tolerances, display rounding, and the zero-position cleanup rule consistently.
-- Add a `GET /api/chat` history endpoint (or explicitly make history frontend-only). The current persistent `chat_messages` schema otherwise has no retrieval path.
-- Add pagination/limits to trade history, chat history, and portfolio-history endpoints before the data grows indefinitely.
+Specify a single database transaction that obtains one cached price, validates
+positive finite quantity and side, changes cash/position, appends the trade,
+removes or retains zero-quantity positions, and writes the snapshot. Decide
+whether request IDs make retries idempotent. Use fixed-point/`Decimal` storage
+(or explicitly defined integer minor units), not SQLite `REAL`, for cash,
+prices, quantities, and P&L; binary floating point will otherwise create
+visible balance and validation errors.
 
-## Security and operational concerns
+### 4. LLM integration cannot be implemented from the stated dependencies
 
-- No login is acceptable for a local demo, but it means anyone who can reach the port can mutate the same portfolio and use the API key indirectly through chat. Bind the container to localhost by default and state that this is not a multi-user or internet-exposed deployment.
-- Ensure `.env` is ignored and never copied into the image. Pass secrets at runtime only. Redact provider errors and never return API-key-bearing details to the client or logs.
-- The LLM must not be trusted to bypass business validation. Validate every generated ticker, side, quantity, cash/share constraint, and watchlist mutation using the same service used by manual requests.
-- Add health/readiness semantics: `/api/health` should report DB readiness and market-source state without contacting the LLM provider. Consider a separate readiness status if startup tasks can fail.
+Section 9 requires a `cerebras-inference` skill, but no such available skill is
+named in the environment. The existing backend dependencies also do not
+include LiteLLM or a structured-output/schema-validation library. “LiteLLM via
+OpenRouter ... with Cerebras as the inference provider” does not give the
+required provider/model configuration, version, request format, or a verified
+structured-output capability/fallback.
 
-## Testing gaps to make measurable
+Define the actual package versions and provider configuration, the exact
+validated response model, timeouts/retries, and behavior for API failure,
+invalid JSON, unsupported structured outputs, and a missing key. Do not leave
+agents to invent a security-relevant execution path from a prompt.
 
-Add acceptance criteria for:
+### 5. LLM action semantics are dangerously underspecified
 
-- atomic transaction behavior when a trade update fails partway through;
-- stale/missing prices and invalid/unknown symbols;
-- duplicate SSE connections and client reconnects without leaked server loops;
-- DB persistence across a container restart;
-- mock LLM exact fixtures and malformed real-provider output;
-- static-export deep-link fallback (a direct request to an app route must serve the SPA entry point if client routes are used);
-- an offline, reproducible test command that does not require API keys or live Massive responses.
+The schema permits arbitrary lists of buys, sells, adds, and removals, but does
+not constrain ticker syntax, quantity bounds/precision, max action count,
+ordering, duplicate/conflicting actions, or transactional behavior. It also
+says failed actions are included “so the LLM can inform the user,” even though
+the LLM call already completed; it is unclear whether the backend augments the
+message, makes a second call, or merely returns an action failure.
 
-## Suggested implementation order
+Define server-side allowlists/limits and normalization, execute actions through
+the same service as manual trades, return per-action outcomes, and make clear
+whether one invalid action rolls back all actions or valid independent actions
+continue. The server must treat LLM output as untrusted input; the prompt is
+not validation or authorization.
 
-1. Correct encoding; settle volume, local-development, price-source, and one-worker decisions.
-2. Write `planning/API_CONTRACT.md`, including JSON examples and shared error/status rules.
-3. Build and test backend domain services (prices, portfolio, watchlist) before routes and LLM wiring.
-4. Add routes/SSE and backend integration tests using mock data.
-5. Build the frontend against the contract, then add deterministic mock-mode E2E coverage.
-6. Containerize and verify the documented fresh-start and persistence flows.
+## High
 
-## Release checklist
+### 6. “Runs immediately” and “required OpenRouter key” are contradictory
 
-- [ ] Fresh start displays seeded watchlist, simulated/source label, $10,000 cash, and connected status.
-- [ ] Valid buy/sell operations are atomic and persist across restart.
-- [ ] Invalid, stale, or unavailable prices cannot execute trades.
-- [ ] Watchlist removal does not make an owned position unpriced.
-- [ ] Mock mode works with no provider keys and all automated tests pass offline.
-- [ ] The image contains no secrets and the default launch is local-only.
-- [ ] Docker launch, scripts, DB location, and documentation all describe the same persistence model.
+First launch promises no setup beyond Docker, while `OPENROUTER_API_KEY` is
+marked required and the Docker example always uses `--env-file .env`. No
+behavior is defined when `.env` does not exist, the key is absent, or it is
+invalid. Docker itself fails if an explicitly supplied env file is absent.
+
+Choose a product behavior: make chat gracefully unavailable while all market
+features run, enable mock mode by default for local launch, or require setup
+and change the first-launch promise. Document both start scripts' exact env
+handling and a health/readiness response that exposes degraded data/LLM state
+without exposing secrets.
+
+### 7. “Daily change %” and the requested charts lack a data definition
+
+The cache exposes only the last tick's change; neither source supplies a
+previous close/day-open baseline. Thus the required watchlist “daily change %”
+cannot be calculated consistently, especially for the simulator. Likewise,
+the main chart needs a time series but the cache keeps only the latest update;
+the plan says sparklines accumulate client-side only since page load, which
+does not cover an initial selected chart, reconnects, or late-added tickers.
+
+Define a market-session baseline and timezone, the source/fallback for it, and
+whether “daily” is actual market day, simulator-session, or last-tick change.
+Define the detailed-chart data source, retention/window, maximum points, and
+reconnect/backfill behavior. Decide whether it is intentionally empty before
+enough SSE samples arrive.
+
+### 8. Database initialization and evolution are inconsistent
+
+The plan says initialization happens on startup “(or first request)” and also
+says the backend lazily initializes on first request. Those are materially
+different for startup market subscriptions, health checks, and concurrent first
+requests. “Creates schema if tables are missing” is not a migration strategy:
+it gives no schema versioning, upgrade path, or definition of an incompatible
+existing database.
+
+Pick one lifecycle (normally initialization before serving requests), serialize
+it, and define migrations/version checks and failure behavior. State the
+database access approach and connection/locking configuration for FastAPI so
+background snapshot writes and requests do not cause `database is locked`.
+
+### 9. Real-data startup and failure behavior is missing
+
+The existing `MassiveDataSource.start()` performs an immediate poll. A bad key,
+network outage, quota response, or provider API change can therefore prevent
+application startup rather than merely leave stale/no prices. The plan also
+claims “live” market data but does not define session/holiday behavior,
+delayed/free-tier data, stale-price labeling, poll interval configuration, or
+what happens when an added symbol is invalid/not returned.
+
+Specify startup degradation/retry semantics, stale-data timestamps and UI
+states, configurable interval and rate-limit policy, invalid-symbol response,
+and whether the app ever falls back to the simulator after a real-data failure.
+
+### 10. The single-container persistence description contradicts itself
+
+The command mounts a named volume (`finally-data:/app/db`), but the text then
+says the project-root `db/` directory maps to `/app/db`, which would be a bind
+mount (`./db:/app/db`). These have different visibility, lifecycle, backup, and
+test-reset behavior. The directory structure calls `db/` the volume-mount
+target, further obscuring the intended deployment.
+
+Choose one primary mount form and use it consistently in Dockerfile, compose,
+scripts, tests, and documentation. Also define the image/container name,
+network/container name, port-conflict behavior, and whether scripts use a
+fresh or retained database.
+
+### 11. In-memory market state limits the deployment topology
+
+Price cache and source are in-process. Multiple Uvicorn workers or multiple
+container replicas produce different simulations/caches and can execute
+competing trades against the same SQLite database. The plan simultaneously
+mentions cloud deployment without stating this limitation.
+
+Explicitly require one worker and one replica for the core build, or redesign
+state ownership. The health endpoint should distinguish process liveness from
+market-source readiness.
+
+## Medium
+
+### 12. Ticker normalization and eligibility are unspecified and inconsistent
+
+SQLite's uniqueness treatment, manual API input, LLM output, and simulator
+behavior can diverge on `aapl`, whitespace, punctuation, duplicates, and
+unknown symbols. The supplied Massive source normalizes ticker input, whereas
+the simulator source does not. Unknown symbols get random simulator prices but
+may be rejected or absent in Massive.
+
+Set one canonical ticker format and validation policy, normalize before every
+database lookup/write, set a watchlist size limit, and specify source-specific
+unknown-symbol handling. Also decide whether a ticker must be watched before
+it can be traded, and how a first price is obtained before an immediate order.
+
+### 13. Portfolio semantics remain incomplete
+
+Define whether total value includes cash (the text implies yes but does not
+say), whether unrealized P&L includes realized gains, how percentage P&L is
+defined at zero cost, and what value/color is used for missing/stale prices.
+Specify heatmap behavior for all-cash/zero positions, zero or negative P&L,
+and min-sized tiles. The current schema has no realized-P&L field, so its
+calculation must be explicitly derived from the trade ledger if shown.
+
+### 14. Snapshot scheduling has operational gaps
+
+The 30-second task has no defined lifecycle, initial snapshot, alignment,
+deduplication with post-trade snapshots, retention/downsampling, ordering, or
+timezone format. On a fresh launch the P&L chart may have no points until the
+first scheduled tick unless initialization writes one. Over time, permanent
+30-second rows grow without bound.
+
+Define the initial point, timestamp standard (UTC ISO 8601 with `Z` is
+recommended), query order/limits, and retention/downsampling policy.
+
+### 15. Static Next export hosting needs routing details
+
+The plan calls the UI a SPA and asks FastAPI to serve an exported Next build,
+but does not state static mount ordering, an `index.html` fallback for direct
+client routes, asset base path, cache headers, or the Next configuration needed
+for static export. This commonly produces API routes shadowed by static files
+or 404s on refresh. If the app truly has one page, say so and avoid client
+routes; otherwise specify the fallback behavior.
+
+### 16. SSE requirements do not define production/client behavior
+
+Native EventSource reconnects, but the plan does not say how the UI distinguishes
+initial connection, retrying, a permanently failing endpoint, and a stale last
+event. Nor does it define heartbeats for quiet/empty streams, cache-control for
+proxies, cleanup, backoff, or how to prevent a reconnect from duplicating chart
+points. “All tickers known to the system” contradicts the earlier union of
+watched tickers and must be reconciled with the position rule above.
+
+### 17. Testing is a list of intentions, not a reproducible test contract
+
+`docker-compose.test.yml` lacks service definitions, build contexts, readiness
+checks, test commands, artifact handling, fixed browser image/version, and a
+fresh database policy. Mock LLM responses are called deterministic but their
+request-to-response behavior is unspecified, so no agent can write stable chat
+assertions. “Disconnect and verify reconnection” lacks a controllable failure
+mechanism and observable acceptance criterion.
+
+Add test fixtures/contracts for mock prompts/actions, deterministic simulator
+configuration (seed/clock or tolerant assertions), selectors/accessibility
+requirements for Playwright, and precise end-to-end assertions.
+
+## Low
+
+### 18. Documentation encoding is corrupted
+
+The plan contains mojibake throughout (for example `FinAlly â€”`, `â†’`, and box
+drawing characters). If agents copy these strings or diagrams, generated files
+and UI text can inherit corrupted characters. Restore UTF-8 before treating
+this document as a canonical shared contract.
+
+### 19. Some implementation choices are left open where consistency matters
+
+“Canvas-based charting library preferred (Lightweight Charts or Recharts)” is
+not a decision (Recharts is primarily SVG), and package/license/SSR-static
+export compatibility is unaddressed. The responsive/tablet requirement also
+does not define the collapse/reflow behavior for the many simultaneous panels.
+Choose the chart library and provide a minimal layout breakpoint specification
+to prevent agents from building incompatible component assumptions.
+
+### 20. Security and operational limits are absent even for localhost use
+
+No auth is a deliberate product choice, but the plan should still set request
+body limits, CORS/host policy, logging/redaction rules for keys and chat
+content, dependency/security-update expectations, and rate/concurrency limits
+for chat. These are particularly relevant because arbitrary users of a
+deployed cloud instance can spend the configured OpenRouter quota and trigger
+auto-trades in its shared default account.
